@@ -26,6 +26,7 @@ except Exception:
 
 MODEL_EMBED = "text-embedding-3-small"
 EMBED_DIM = 1536  # 現行の次元数
+TEXT_MODEL = "gpt-4o-mini"  # ルール未登録時の一般回答に使用
 
 # ============= ユーティリティ ============= #
 
@@ -40,6 +41,49 @@ def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+# 一般的な目安（ルール未登録時のフォールバック）
+def generic_guideline(q: str) -> str:
+    qn = normalize(q)
+    candidates = [
+        (r"おやつ|間食", "（一般的な目安）おやつは少量で、夕食の2〜3時間前までに食べ終える家庭が多いよ。たとえば午後3時ごろまでに食べる家庭が多いみたい。"),
+        (r"テレビ|YouTube|動画", "（一般的な目安）スクリーンタイムは平日1日1時間程度、就寝1時間前はオフにする家庭が多いよ。"),
+        (r"ゲーム|Switch|PS|PlayStation|任天堂", "（一般的な目安）宿題や家事の後で1日60〜90分に制限する家庭が多いよ。"),
+        (r"スマホ|スマートフォン|タブレット", "（一般的な目安）食事中は使わない・就寝1時間前はオフ・パスコードを保護者と共有する、といったルールの家庭が多いよ。"),
+        (r"寝|就寝|ねる|ベッド", "（一般的な目安）小学生は21時前後に就寝する家庭が多いよ。寝る前のスクリーンは控えるのが良いと言われているよ。"),
+        (r"起き|起床", "（一般的な目安）登校時刻から逆算して7〜9時間の睡眠を確保するようにしている家庭が多いよ。"),
+        (r"勉強|宿題", "（一般的な目安）帰宅後にまず宿題を済ませ、ゲームや動画はその後にする家庭が多いよ。"),
+        (r"片付け|掃除", "（一般的な目安）使ったら元に戻す・寝る前の5分お片付けタイムを設ける家庭が多いよ。"),
+        (r"外出|公園", "（一般的な目安）大人と一緒に行動し、日没後の単独外出は控える家庭が多いよ。"),
+    ]
+    for pat, text in candidates:
+        if re.search(pat, qn):
+            return text
+    return "（一般的な目安）家庭ごとに違うけど、まずは保護者に確認してね。必要なら管理画面からルールを追加してもらおう。"
+
+# OpenAIで一般回答を生成（失敗時は上のgeneric_guidelineにフォールバック）
+def llm_generic_guideline(q: str) -> str:
+    if not OPENAI_AVAILABLE:
+        return generic_guideline(q)
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        sys = (
+            "あなたは家庭の一般的な生活ルールについて、日本語でやさしく説明するアシスタントです。"
+            "対象は小学生くらいの子ども。断定しすぎず、一般的な傾向として述べ、"
+            "家庭ごとに違うこと・最終判断は保護者だと明示。医療・法律の助言はしない。"
+            "出力は2〜3文、タメ口すぎないフレンドリーな言葉遣いで。"
+        )
+        user = f"子どもからの質問:『{q}』。一般的にはどう言われているか、1段落で簡潔に答えて。"
+        resp = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.6,
+            max_tokens=200,
+        )
+        text = resp.choices[0].message.content.strip()
+        return f"（一般的な目安）{text}"
+    except Exception:
+        return generic_guideline(q)
 
 # ============= データ層（Supabase or JSON） ============= #
 class RuleStore:
@@ -195,13 +239,14 @@ class RuleAssistant:
             return f"もしかして『{rule['title']}』かな？\n{rule['content']}", rule, best
         else:
             self.store.log_unknown(question)
-            return "そのルールはまだ知らないよ。教えてくれる？（あとで保護者の方が追加してね）", None, best
+            fallback = llm_generic_guideline(question)
+            return f"{fallback}\n\nそのルールはまだ登録されていないので詳しくはお父さんやお母さんに聞いてね。", None, best
 
 # ============= Streamlit UI ============= #
 load_dotenv()
 
-st.set_page_config(page_title="Family Rules Bot", page_icon="👨\u200d👩\u200d👧\u200d👦", layout="centered")
-st.title("👨\u200d👩\u200d👧\u200d👦 家庭ルールボット")
+st.set_page_config(page_title="Family Rules Bot", page_icon="👨‍👩‍👧‍👦", layout="centered")
+st.title("👨‍👩‍👧‍👦 家庭ルールボット")
 st.caption("家庭のルールをAIがやさしくお知らせします")
 
 # --- サイドバー（設定＆管理） ---
@@ -211,19 +256,15 @@ with st.sidebar:
     st.write(":information_source: PINは簡易なUI切替のためのものです。厳格な認証が必要ならAuth導入を検討してください。")
 
 # --- データストア選択（自動） ---
-from pathlib import Path
 
 def _get_secret(name: str, default=None):
-    """st.secrets は secrets.toml が無いローカルで触るとエラーになるため、
-    ファイルの存在を確認してから安全に参照するヘルパー。"""
+    """Streamlit Cloud では st.secrets を辞書アクセスで読むのが確実。
+    ローカルで secrets.toml が無くても例外を飲み込んで default を返す。
+    """
     try:
-        user_secrets = Path.home() / ".streamlit" / "secrets.toml"
-        proj_secrets = Path.cwd() / ".streamlit" / "secrets.toml"
-        if user_secrets.exists() or proj_secrets.exists():
-            return st.secrets.get(name, default)
+        return st.secrets[name]
     except Exception:
-        pass
-    return default
+        return default
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or _get_secret("OPENAI_API_KEY")
 SUPABASE_URL   = os.getenv("SUPABASE_URL")   or _get_secret("SUPABASE_URL")
@@ -248,7 +289,7 @@ else:
 embedder = Embedder(api_key=OPENAI_API_KEY)
 assistant = RuleAssistant(store, embedder, threshold=0.62)
 
-# --- 管理UI（PINが "admin" など特定文字列で開く例） ---
+# --- 管理UI（PINが一致したら開く） ---
 if admin_pin == EXPECTED_PIN:
     st.subheader("🛠️ ルール管理（管理者向け）")
     with st.form("add_rule"):
@@ -270,12 +311,13 @@ if admin_pin == EXPECTED_PIN:
             with cols[1]:
                 if st.button("削除", key=f"del_{r['id']}"):
                     store.delete_rule(r['id'])
-                    st.experimental_rerun()
+                    st.rerun()
     else:
         st.info("まだルールがありません。上のフォームから追加してください。")
 
     st.divider()
     st.write("### 未登録の質問（あとでルール化しましょう）")
+
 # JsonRuleStore の場合はローカル unknowns.json を表示
 if isinstance(store, JsonRuleStore) and os.path.exists("unknowns.json"):
     with open("unknowns.json", "r", encoding="utf-8") as f:
