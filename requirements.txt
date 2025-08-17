@@ -2,5 +2,5 @@ streamlit==1.37.1
 python-dotenv==1.0.1
 openai==1.40.2
 numpy==1.26.4
-pyarrow==15.0.2
+# Supabase を使う場合のみ
 supabase==2.6.0
